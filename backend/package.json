@@ -8,9 +8,9 @@
   },
   "scripts": {
     "config:validate": "node --env-file=.env --import tsx src/scripts/validateEnv.ts",
-    "dev": "tsx watch src/server.ts",
-    "build": "prisma generate && tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "dev": "node init && tsx watch src/server.ts",
+    "build": "node init && prisma generate && tsc -p tsconfig.json",
+    "start": "node init && node dist/server.js",
     "db:backup": "tsx src/scripts/backup.ts",
     "sandbox": "node --env-file=.env --import tsx src/scripts/sandboxSettlement.ts",
     "sandbox:server": "node --env-file=.env --import tsx src/server.ts",
