@@ -346,19 +346,104 @@ describe("ReconciliationService", () => {
       // Simulate crash: new service instance
       const newService = createReconciliationService({
         prisma: db.prisma,
-        submitFn: async () => {
-          throw new Error("Should not be called - already submitted");
-        },
-        checkChainFn: async (hash) => chainState.get(hash) ?? { confirmed: false }
+        submitFn: async () => { throw new Error("should not resubmit"); },
+        checkChainFn: async (tx) => tx === txHash ? { confirmed: true } : { confirmed: false }
       });
 
-      // Chain confirms the transaction
-      chainState.set(txHash, { confirmed: true });
-
-      const result = await newService.submitOutboundAction("crash_recovery_1");
-
-      expect(result.newlySubmitted).toBe(false);
-      expect(result.record.status).toBe("confirmed");
+      const recovered = await newService.reconcileOutboundAction("crash_recovery_1");
+      expect(recovered?.status).toBe("confirmed");
+      expect(recovered?.txHash).toBe(txHash);
     });
   });
-});
+
+  describe("Repair command", () => {
+    it("performs no writes in dry-run mode", async () => {
+      await service.createOrGetOutboundAction({
+        actionKey: "repair_dry_1",
+        actionType: "payout",
+        payload: { amount: "100" }
+      });
+
+      const before = await service.getOutboundAction("repair_dry_1");
+      const report = await service.repairActions({ mode: "dry-run" });
+      const after = await service.getOutboundAction("repair_dry_1");
+
+      expect(report.mode).toBe("dry-run");
+      expect(report.applied).toBe(false);
+      expect(after).toEqual(before);
+    });
+
+    it("applies repairs in apply mode and writes audit records", async () => {
+      await service.createOrGetOutboundAction( {
+        actionKey: "repair_apply_1",
+        actionType: "payout",
+        payload: { amount: "100" }
+      });
+
+      // Force an inconsistent state: submitted with no txHash
+      await db.prisma.outboundAction.update({
+        where: { actionKey: "repair_apply_1" },
+        data: { status: "submitted", txHash: null }
+      });
+
+      const report = await service.repairActions({ mode: "apply" });
+      expect(report.mode).toBe("apply");
+      expect(report.applied).toBe(true);
+      expect(report.repaired).toBeGreaterThanOrEqual(1);
+
+      const record = await service.getOutboundAction("repair_apply_1");
+      expect(record?.status).toBe("pending");
+      expect(record?.txHash).toBeNull();
+
+      const auditRecords = await db.prisma.repairAudit.findMany({ where: { actionKey: "repair_apply_1" } });
+      expect(auditRecords.length).toBeGreaterThanOrEqual(1);
+      expect(auditRecords[0].mode).toBe("apply");
+    });
+
+    it("reports no-op when no inconsistencies exist", async () => {
+      await service.createOrGetOutboundAction({
+        actionKey: "repair_noop_1",
+        actionType: "payout",
+        payload: { amount: "100" }
+      });
+
+      const report = await service.repairActions({ mode: "dry-run" });
+      expect(report.repaired).toBe(0);
+      expect(report.candidates).toHaveLength(0);
+    });
+
+    it("throws on invalid target", async () => {
+      await expect(service.repairActions({ mode: "apply", targetActionKey: "missing_key" })).rejects.toThrow("invalid target");
+    });
+
+    it("repairs only targeted records", async () => {
+      await service.createOrGetOutboundAction( {
+        actionKey: "repair_target_1",
+        actionType: "payout",
+        payload: { amount: "100" }
+      });
+      await service.createOrGetOutboundAction( {
+        actionKey: "repair_target_2",
+        actionType: "payout",
+        payload: { amount: "200" }
+      });
+
+      await db.prisma.outboundAction.update({
+        where: { actionKey: "repair_target_1" },
+        data: { status: "submitted", txHash: null }
+      });
+      await db.prisma.outboundAction.update({
+        where: { actionKey: "repair_target_2" },
+        data: { status: "submitted", txHash: null }
+      });
+
+      const report = await service.repairActions({ mode: "apply", targetActionKey: "repair_target_1" });
+      expect(report.repaired).toBe(1);
+
+      const one = await service.getOutboundAction("repair_target_1");
+      const two = await service.getOutboundAction("repair_target_2");
+      expect(one?.status).toBe("pending");
+      expect(two?.status).toBe("submitted");
+    });
+  });
+})
