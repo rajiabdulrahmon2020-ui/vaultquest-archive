@@ -386,6 +386,32 @@ model WalletSession {
   @@map("wallet_sessions")
 }
 
+// #VaultQuest — privacy-safe user data export. One row per export request.
+// `walletAddress` is the authorization subject: only records whose
+// walletAddress matches the requester (or an admin acting on their behalf)
+// may be included. `schemaVersion` and `generatedAt` are surfaced in the
+// export payload so consumers can detect format drift. `expiresAt` drives
+// retention: exports past expiry are treated as gone and may be purged.
+model UserDataExport {
+  id            String    @id @default(uuid()) @db.Uuid
+  walletAddress String    @map("wallet_address")
+  schemaVersion String    @map("schema_version")
+  status        String    @default("pending")
+  recordCount   Int       @default(0) @map("record_count")
+  payload       Json?
+  errorCode     String?   @map("error_code")
+  errorDetail   String?   @map("error_detail")
+  generatedAt   DateTime? @map("generated_at")
+  expiresAt     DateTime  @map("expires_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@index([walletAddress, createdAt(sort: Desc)])
+  @@index([status, expiresAt])
+  @@index([expiresAt])
+  @@map("user_data_exports")
+}
+
 model RepairQuarantine {
   id          String   @id @default(uuid()) @db.Uuid
   recordType  String   @map("record_type")
@@ -404,14 +430,19 @@ model RepairQuarantine {
 // Defaults are always the safer behavior (disabled for new features, enabled for safeguards)
 model FeatureFlag {
   id          String   @id @default(uuid()) @db.Uuid
-  key         String   @unique
+  key         String
   enabled     Boolean  @default(false)
   description String?
   scope       String   @default("global") // "global", "vault:{id}", "wallet:{address}"
+  /// Holds `rollout` (see services/featureFlagRollout.ts) alongside any other keys.
   metadata    Json?
   updatedAt   DateTime @updatedAt @map("updated_at")
   createdAt   DateTime @default(now()) @map("created_at")
 
+  // Matches the "feature_flags_key_scope_key" constraint that migration
+  // 20260927000001 already creates; the schema used to declare `key @unique`,
+  // which the database never had.
+  @@unique([key, scope])
   @@index([key, scope])
   @@index([scope])
   @@map("feature_flags")
@@ -441,6 +472,7 @@ model SavedPool {
   asset            String
   participantCount Int      @map("participant_count")
   expectedYield    String   @map("expected_yield")
+  provenance       Json?
   prize            String?
   opensAt          DateTime? @map("opens_at")
   locksAt          DateTime? @map("locks_at")
@@ -510,92 +542,127 @@ model TrendAggregate {
   @@map("trend_aggregates")
 }
 
-// Idempotency keys for replay protection on high-risk write operations
-model IdempotencyKey {
-  id             String   @id @default(uuid()) @db.Uuid
-  key            String   @unique
-  operationType  String   @map("operation_type")
-  walletAddress  String?  @map("wallet_address")
-  status         String   @default("pending") // "pending", "completed", "failed", "expired"
-  response       Json?    @map("response")
-  errorCode      String?  @map("error_code")
-  errorDetail    String?  @map("error_detail")
-  expiresAt      DateTime @map("expires_at")
-  createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
-
-  @@index([walletAddress, expiresAt])
-  @@index([expiresAt])
-  @@index([operationType, expiresAt])
-  @@map("idempotency_keys")
-}
-
-// #791 — scoped, time-limited maintainer impersonation sessions.
-model ImpersonationSession {
-  id                  String    @id @default(uuid()) @db.Uuid
-  maintainerSubject   String    @map("maintainer_subject")
-  targetWallet        String    @map("target_wallet")
-  reason              String
-  allowMutations      Boolean   @default(false) @map("allow_mutations")
-  state               String    @default("active") // active | expired | ended
-  startedAt           DateTime  @default(now()) @map("started_at") @db.Timestamptz
-  expiresAt           DateTime  @map("expires_at") @db.Timestamptz
-  endedAt             DateTime? @map("ended_at") @db.Timestamptz
-
-  @@index([maintainerSubject, state])
-  @@index([expiresAt])
-  @@map("impersonation_sessions")
-}
-
-// #793 — partial failure tracking for background and external integrations.
-// Records operations that completed partially: one side succeeded but the
-// other (external system, on-chain confirmation, email, etc.) did not.
-model PartialFailure {
+// #VaultQuest — derived/cached records that mirror source-of-truth data
+// (vault accounting, prize draws, wallet flows, dashboards, reporting).
+model DerivedCache {
   id              String    @id @default(uuid()) @db.Uuid
-  operationType   String    @map("operation_type")   // "background_job" | "external_call" | "on_chain" | "wallet_flow"
-  operationId     String    @map("operation_id")     // e.g. actionId, jobId, txHash
-  externalRef     String?   @map("external_ref")     // external system reference (no secrets)
-  severity        String    @default("medium")       // "low" | "medium" | "high" | "critical"
-  state           String    @default("unresolved")   // "unresolved" | "retryable" | "resolved" | "ignored"
-  retryable       Boolean   @default(false)
-  description     String                             // human-readable summary (no secrets)
-  metadata        Json?                              // sanitized context for investigation
-  detectedAt      DateTime  @default(now()) @map("detected_at") @db.Timestamptz
-  staleSinceAt    DateTime? @map("stale_since_at") @db.Timestamptz
-  lastRetriedAt   DateTime? @map("last_retried_at") @db.Timestamptz
-  resolvedAt      DateTime? @map("resolved_at") @db.Timestamptz
-  resolvedBy      String?   @map("resolved_by")
-  resolutionNote  String?   @map("resolution_note")
-  ignoredAt       DateTime? @map("ignored_at") @db.Timestamptz
-  ignoredBy       String?   @map("ignored_by")
-  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz
+  cacheKey        String    @unique @map("cache_key")
+  cacheType       String    @map("cache_type")
+  sourceType      String    @map("source_type")
+  sourceId        String    @map("source_id")
+  sourceVersion   BigInt    @map("source_version")
+  sourceUpdatedAt DateTime  @map("source_updated_at") @db.Timestamptz
+  payload         Json
+  computedAt      DateTime  @default(now()) @map("computed_at") @db.Timestamptz
+  expiresAt       DateTime? @map("expires_at") @db.Timestamptz
+  staleAt         DateTime? @map("stale_at") @db.Timestamptz
+  staleReason     String?   @map("stale_reason")
+  repairJobId     String?   @map("repair_job_id") @db.Uuid
+  repairAttempts  Int       @default(0) @map("repair_attempts")
+  lastRepairError String?   @map("last_repair_error")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz
 
-  @@index([state, detectedAt(sort: Desc)])
-  @@index([operationType, state])
-  @@index([severity, state])
-  @@index([retryable, state])
-  @@map("partial_failures")
-}
-
-// #799 — Processed webhook event IDs and cached responses for replay window and deduplication.
-model ProcessedWebhookEvent {
-  id             String    @id @default(uuid()) @db.Uuid
-  provider       String
-  eventId        String    @map("event_id")
-  eventType      String    @map("event_type")
-  payloadHash    String    @map("payload_hash")
-  status         String    @default("processed") // "processing" | "processed" | "failed"
-  response       Json?     @map("response")
-  error          String?   @map("error")
-  receivedAt     DateTime  @default(now()) @map("received_at") @db.Timestamptz
-  processedAt    DateTime? @map("processed_at") @db.Timestamptz
-  expiresAt      DateTime  @map("expires_at") @db.Timestamptz
-  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz
-
-  @@unique([provider, eventId])
+  @@index([cacheType, staleAt])
+  @@index([sourceType, sourceId])
   @@index([expiresAt])
-  @@index([provider, receivedAt])
-  @@map("processed_webhook_events")
+  @@map("derived_cache")
 }
 
+// #VaultQuest — append-only log of stale-cache detection and repair runs.
+model CacheRepairRun {
+  id             String    @id @default(uuid()) @db.Uuid
+  jobName        String    @map("job_name")
+  dryRun         Boolean   @default(true) @map("dry_run")
+  detectedCount  Int       @default(0) @map("detected_count")
+  repairedCount  Int       @default(0) @map("repaired_count")
+  failedCount    Int       @default(0) @map("failed_count")
+  planJson       Json      @map("plan_json")
+  appliedJson    Json?     @map("applied_json")
+  errorDetail    String?   @map("error_detail")
+  startedAt      DateTime  @default(now()) @map("started_at") @db.Timestamptz
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz
+
+  @@index([jobName, startedAt(sort: Desc)])
+  @@index([dryRun, startedAt(sort: Desc)])
+  @@map("cache_repair_runs")
+}
+
+/// Time-bounded, audited maintainer support access (issue #support-access).
+/// Grants are scoped to one resource and expire automatically; every use (or
+/// denied use) is recorded in the append-only `support_access_audit` chain.
+model SupportAccessGrant {
+  id          String    @id @default(uuid()) @db.Uuid
+  requesterId String    @map("requester_id")
+  reason      String
+  ticketRef   String    @map("ticket_ref")
+  scopeType   String    @map("scope_type")
+  scope       String
+  expiresAt   DateTime  @map("expires_at")
+  revokedAt   DateTime? @map("revoked_at")
+  revokedBy   String?   @map("revoked_by")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([scopeType, scope, expiresAt])
+  @@map("support_access_grants")
+}
+
+/// Append-only, hash-chained audit trail. Immutability is enforced by a
+/// database trigger (migration `20261016000000_support_access_and_imports`),
+/// so application bugs or ad-hoc SQL cannot rewrite history.
+model SupportAccessAuditEntry {
+  id        String   @id @default(uuid()) @db.Uuid
+  grantId   String?  @map("grant_id")
+  actor     String
+  action    String
+  scope     String
+  detail    Json?
+  prevHash  String?  @map("prev_hash")
+  entryHash String   @map("entry_hash")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([grantId, createdAt])
+  @@map("support_access_audit")
+}
+
+/// Secure import pipeline (issue #imports). A batch starts as a `preview`;
+/// committed actions are traceable through `import_rows.applied_ref`.
+model ImportBatch {
+  id              String      @id @default(uuid()) @db.Uuid
+  kind            String
+  status          String      @default("preview")
+  sourceName      String?     @map("source_name")
+  contentHash     String      @map("content_hash")
+  idempotencyKey  String      @unique @map("idempotency_key")
+  createdBy       String      @map("created_by")
+  totalRows       Int         @map("total_rows")
+  acceptedRows    Int         @map("accepted_rows")
+  quarantinedRows Int         @map("quarantined_rows")
+  appliedRows     Int         @default(0) @map("applied_rows")
+  rolledBackRows  Int         @default(0) @map("rolled_back_rows")
+  createdAt       DateTime    @default(now()) @map("created_at")
+  committedAt     DateTime?   @map("committed_at")
+  rolledBackAt    DateTime?   @map("rolled_back_at")
+  rows            ImportRow[]
+
+  @@index([kind, createdAt(sort: Desc)])
+  @@map("import_batches")
+}
+
+model ImportRow {
+  id               String      @id @default(uuid()) @db.Uuid
+  batchId          String      @map("batch_id")
+  rowNumber        Int         @map("row_number")
+  status           String
+  quarantineReason String?     @map("quarantine_reason")
+  quarantineDetail String?     @map("quarantine_detail")
+  payload          Json?
+  appliedRef       String?     @map("applied_ref")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+  batch            ImportBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+
+  @@unique([batchId, rowNumber])
+  @@index([batchId, status])
+  @@map("import_rows")
+}

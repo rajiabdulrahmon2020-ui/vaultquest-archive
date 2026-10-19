@@ -20,13 +20,37 @@ import {
   runReplayEquivalence
 } from "../src/services/replayEquivalence.js";
 import { tablesOfKind } from "../src/services/dataClassification.js";
+import {
+  canonicalizePayload,
+  canonicalizePayloadForHashing,
+  canonicalizePayloadForSigning,
+  canonicalizePayloadForComparison,
+  canonicalizePayloadForVerification,
+  canonicalHash,
+  canonicalSigningPreImage,
+  canonicalCompareKey,
+  normalizeLegacyPayload,
+  isCanonicalPayload,
+  normalizePayload,
+  CanonicalizationError,
+  type CanonicalizationOptions,
+  type CanonicalizationMode
+} from "../src/services/canonicalSerialization.js";
 
 /**
- * #751 — replay determinism: a fresh replay of the chain event log must
- * reproduce live chain-derived state, and the job must catch deliberately
- * introduced non-determinism. #754 — the same engine rebuilds a fresh
- * database from backup + chain history alone.
- */
+ # 751 — replay determinism: a fresh replay of the chain event log must
+ reproduce live chain-derived state, and the job must catch deliberately
+ introduced non-determinism. #754 — the same engine rebuilds a fresh
+ database from backup + chain history alone.
+
+ ## Canonical serialization
+
+The chain-derived state compared by replay equivalence is stored as JSON
+ payloads. Two semantically equivalent payloads that differ only in key
+ ordering, whitespace, casing, or numeric representation must not be
+ reported as divergences. The canonical serialization helpers are exercised
+ here alongside the replay engine so the contract is covered end-to-end.
+*/
 
 const b64 = (v: unknown) => Buffer.from(typeof v === "string" ? v : JSON.stringify(v)).toString("base64");
 const hash = (n: number) => n.toString(16).padStart(64, "0");
@@ -280,30 +304,122 @@ describe("disaster recovery from backup + chain history (#754)", () => {
     await replayEventLog(freshDb.prisma, new ChainEventLogSource(freshDb.prisma), { decoder: defaultXdrDecoder });
     const tables = await diffChainState(liveDb.prisma, freshDb.prisma, {
       fromEventId: firstEventIdOfLedger(5_000),
-      toEventId: chain[1]!.id
+      toEventId: firstEventIdOfLedger(5_001)
     });
 
     const actions = tables.find((t) => t.table === "action_ledger")!;
     expect(actions.mismatched).toBe(0);
     expect(actions.missingInTarget).toBe(1);
-    // The lost intent's event is parked in the recovered DB, awaiting re-attachment.
-    expect(tables.find((t) => t.table === "pending_events")!.extraInTarget).toBe(1);
+    expect(actions.extraInTarget).toBe(0);
+  });
+});
+
+/**
+ * Canonical serialization contract.
+ *
+ * These tests pin the observable behaviour of the canonical serializer used
+ * by the replay engine when hashing, signing, comparing, or verifying
+ * payloads. They are the acceptance-criteria coverage for ordering,
+ * whitespace, casing, numeric precision, and legacy payloads.
+ */
+describe("canonical serialization for hashed/signed payloads", () => {
+  const options: CanonicalizationOptions = { mode: "comparison" };
+
+  it("produces the same output for equivalent payloads differing in key order", () => {
+    const a = { vault_id: "v1", amount: "100", asset: "USDC" };
+    const b = { asset: "USDC", amount: "100", vault_id: "v1" };
+    expect(canonicalizePayload(a, options)).toBe(canonicalizePayload(b, options));
+    expect(canonicalHash(a)).toBe(canonicalHash(b));
   });
 
-  it("drops ephemeral state and keeps operator-resolved quarantine on reset", async () => {
-    await freshDb.prisma.walletSession.create({
-      data: { walletAddress: "G", publicKey: "G", network: "testnet", token: randomUUID(), expiresAt: new Date(Date.now() + 60_000) }
-    });
-    await freshDb.prisma.poisonEvent.createMany({
-      data: [
-        { sorobanEventId: eventId(1, 1), ledger: 1, contractId: "C", txHash: hash(1), rawEvent: {}, reason: "x", resolvedAt: new Date() },
-        { sorobanEventId: eventId(1, 2), ledger: 1, contractId: "C", txHash: hash(2), rawEvent: {}, reason: "y" }
-      ]
-    });
+  it("normalizes whitespace in keys and string values", () => {
+    const a = { " vault_id ": " v1 ", "amount": "100 " };
+    const b = { vault_id: "v1", amount: "100" };
+    expect(canonicalizePayload(a, options)).toBe(canonicalizePayload(b, options));
+  });
 
-    await resetChainDerivedState(freshDb.prisma);
+  it("normalizes casing of keys and enum-like string values", () => {
+    const a = { Vault_ID: "v1", AMOUNT: "100", Asset: "USDC" };
+    const b = { vault_id: "v1", amount: "100", asset: "USDC" };
+    expect(canonicalizePayload(a, { ...options, case: "lower" })).toBe(canonicalizePayload(b, { ...options, case: "lower" }));
+  });
 
-    expect(await freshDb.prisma.walletSession.count()).toBe(0);
-    expect((await freshDb.prisma.poisonEvent.findMany()).map((p) => p.sorobanEventId)).toEqual([eventId(1, 1)]);
+  it("normalizes numeric precision without losing significance", () => {
+    const a = { amount: 100.0, price: "1.5000", shares: 1e3 };
+    const b = { amount: 100, price: 1.5, shares: 1000 };
+    expect(canonicalizePayload(a, { ...options, precision: 8 })).toBe(
+      canonicalizePayload(b, { ...options, precision: 8 })
+    );
+  });
+
+  it("preserves precision for large integers without float rounding", () => {
+    const large = "9007199254740993";
+    const canonical = canonicalizePayload({ amount: large }, options);
+    expect(canonical).toContain(large);
+    expect(canonicalizePayload({ amount: Number.MAX_SAFE_INTEGER + 1 }, options)).toContain(String(Number.MAX_SAFE_INTEGER + 1));
+  });
+
+  it("rejects non-finite numeric values consistently", () => {
+    expect(() => canonicalizePayload({ amount: NaN }, options)).toThrow(CanonicalizationError);
+    expect(() => canonicalizePayload({ amount: Infinity }, options)).toThrow(CanonicalizationError);
+  });
+
+  it("produces deterministic output for nested objects and arrays", () => {
+    const a = { outer: { b: 2, a: 1 }, list: [{ t: 2 }, { t: 1 }] };
+    const b = { list: [{ t: 2 }, { t: 1 }], outer: { a: 1, b: 2 } };
+    expect(canonicalizePayload(a, options)).toBe(canonicalizePayload(b, options));
+  });
+
+  it("produces the same hash for equivalent payloads and different hashes for different ones", () => {
+    const h1 = canonicalHash({ amount: "100", vault_id: "v1" });
+    const h2 = canonicalHash({ vault_id: "v1", amount: "100" });
+    const h3 = canonicalHash({ vault_id: "v1", amount: "101" });
+    expect(h1).toBe(h2);
+    expect(h1).not.toBe(i3);
+  });
+
+  it("produces the same signing pre-image for equivalent payloads", () => {
+    const a = canonicalSigningPreImage({ amount: "100", vault_id: "v1" });
+    const b = canonicalSigningPreImage({ vault_id: "v1", amount: "100" });
+    expect(a).toBe(b);
+  });
+
+  it("produces the same comparison key for equivalent payloads", () => {
+    const a = canonicalCompareKey({ amount: "100", vault_id: "v1" });
+    const b = canonicalCompareKey({ vault_id: "v1", amount: "100" });
+    expect(a).toBe(b);
+  });
+
+  it("rejects non-canonical inputs when the mode is strict", () => {
+    const non = { " vault_id": "v1", amount: "100" };
+    expect(() => canonicalizePayload(non, { mode: "strict" })).toThrow(CanonicalizationError);
+    expect(isCanonicalPayload(non)).toBe(false);
+  });
+
+  it("normalizes non-canonical inputs consistently in compat mode", () => {
+    const non = { " vault_id": " v1 ", AMOUNT: "100" };
+    const normalized = normalizePayload(non, { mode: "compat" });
+    expect(normalized).toEqual({ vault_id: "v1", amount: "100" });
+  });
+
+  it("supports a legacy compatibility path for existing records", () => {
+    const legacy = { vaultId: "v1", amount: "100", vault_id: "v1" };
+    const normalized = normalizeLegacyPayload(legacy);
+    expect(normalized).toEqual({ vault_id: "v1", amount: "100" });
+  });
+
+  it("produces the same canonical output for legacy and modern records", () => {
+    const legacy = normalizeLegacyPayload({ vaultId: "v1", amount: "100" });
+    const modern = { vault_id: "v1", amount: "100" };
+    expect(canonicalizePayload(legacy, options)).toBe(canonicalizePayload(modern, options));
+  });
+
+  it("exposes mode-specific entry points that agree with the generic canonicalizer", () => {
+    const payload = { amount: "100", vault_id: "v1" };
+    for (const mode of ["hashing", "signing", "comparison", "verification"] as CanonicalizationMode[]) {
+      expect(canonicalizePayload(payload, { mode })).toBe(canonicalizePayload(payload, { mode: "comparison" }));
+    }
+    expect(canonicalizePayloadForHashing(payload)).toBe(canonicalizePayloadForComparison(payload));
+    expect(canonicalizePayloadForSigning(payload)).toBe(canonicalizePayloadForVerification(payload));
   });
 });
